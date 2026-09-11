@@ -167,3 +167,47 @@ def test_output_limit_fails_without_truncating(monkeypatch):
     monkeypatch.setattr(backend, "MAX_OUTPUT_BYTES", 10)
     with pytest.raises(backend.BackendError, match="output limit"):
         backend._decode(CallToolResult(content=[], structuredContent={"results": []}))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_rendered_output_limit_includes_formatting(monkeypatch, compact):
+    payload = {
+        "results": [{"url": "https://example.org", "excerpts": ["a"] * 100000}]
+    }
+
+    async def request(*args):
+        return backend._decode(CallToolResult(content=[], structuredContent=payload))
+
+    monkeypatch.setattr(backend, "request", request)
+    result = CliRunner().invoke(
+        main, ["fetch", "https://example.org", *(["--json"] if compact else [])]
+    )
+    assert len(result.output.encode("utf-8")) <= backend.MAX_OUTPUT_BYTES
+    if compact:
+        assert result.exit_code == 0
+        assert json.loads(result.output) == payload
+    else:
+        assert result.exit_code == 1
+        assert "Output exceeds" in result.output
+
+
+def test_tools_output_is_bounded(monkeypatch):
+    async def request(*args):
+        return {"tools": ["t" * backend.MAX_OUTPUT_BYTES]}
+
+    monkeypatch.setattr(backend, "request", request)
+    result = CliRunner().invoke(main, ["tools", "--json"])
+    assert result.exit_code == 1
+    assert "Output exceeds" in json.loads(result.output)["error"]
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_repl_needs_no_writable_home(monkeypatch, tmp_path, compact):
+    home = tmp_path / "unavailable-home"
+    home.write_text("not a directory")
+    monkeypatch.setenv("HOME", str(home))
+    result = CliRunner().invoke(
+        main, ["repl", *(["--json"] if compact else [])], input="exit\n"
+    )
+    assert result.exit_code == 0, result.exception
+    assert home.read_text() == "not a directory"

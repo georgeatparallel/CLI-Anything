@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import shlex
 import uuid
 from urllib.parse import urlsplit
@@ -17,19 +18,23 @@ def _run(ctx, tool, arguments, json_output):
         arguments["session_id"] = ctx.obj["session_id"]
     try:
         payload = asyncio.run(backend.request(tool, arguments))
+        output = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=None if json_output or ctx.obj["json"] else 2,
+        )
+        # Include formatting and the trailing newline in the final output bound.
+        if len(output.encode("utf-8")) + 1 > backend.MAX_OUTPUT_BYTES:
+            raise backend.BackendError(
+                "Output exceeds the 1 MiB limit; request fewer URLs or omit --full-content"
+            )
     except backend.BackendError as exc:
         if json_output or ctx.obj["json"]:
             click.echo(json.dumps({"error": str(exc)}))
             ctx.exit(1)
         raise click.ClickException(str(exc)) from exc
     # One payload only, preserving server warnings and partial fetch failures.
-    click.echo(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=None if json_output or ctx.obj["json"] else 2,
-        )
-    )
+    click.echo(output)
 
 
 @click.group(invoke_without_command=True)
@@ -142,7 +147,8 @@ def tools(ctx, json_output):
 @click.pass_context
 def repl(ctx, json_output):
     """Run commands interactively, reusing one task ID until exit."""
-    skin = ReplSkin("parallel")
+    # This stateless REPL uses input(), so it has no persistent history.
+    skin = ReplSkin("parallel", history_file=os.devnull)
     compact = json_output or ctx.obj["json"]
     if not compact:
         skin.print_banner()
