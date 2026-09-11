@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from importlib.metadata import version
 
@@ -20,29 +21,58 @@ class BackendError(Exception):
 
 
 class _BoundedStream(httpx.AsyncByteStream):
-    def __init__(self, stream):
+    def __init__(self, stream, failure):
         self.stream = stream
+        self.failure = failure
 
     async def __aiter__(self):
         total = 0
         async for chunk in self.stream:
             total += len(chunk)
             if total > MAX_RESPONSE_BYTES:
-                raise BackendError("MCP response exceeds the 2 MiB limit")
+                error = BackendError("MCP response exceeds the 2 MiB limit")
+                if not self.failure.done():
+                    self.failure.set_result(error)
+                raise error
             yield chunk
 
     async def aclose(self):
         await self.stream.aclose()
 
 
-async def _bound_response(response):
-    # Reject redirects before another host can receive queries or context.
-    response.raise_for_status()
-    if response.headers.get("content-encoding", "identity") != "identity":
-        raise BackendError(
-            "Unexpected compressed MCP response; cannot enforce the response bound"
-        )
-    response.stream = _BoundedStream(response.stream)
+@asynccontextmanager
+async def _bounded_client():
+    failure = asyncio.get_running_loop().create_future()
+
+    async def bound_response(response):
+        # Reject redirects before another host can receive queries or context.
+        response.raise_for_status()
+        if response.headers.get("content-encoding", "identity") != "identity":
+            error = BackendError(
+                "Unexpected compressed MCP response; cannot enforce the response bound"
+            )
+            if not failure.done():
+                failure.set_result(error)
+            raise error
+        response.stream = _BoundedStream(response.stream, failure)
+
+    async def watch_failure():
+        # The SDK can swallow stream exceptions. Cancel the entire command when
+        # a response violates our bounds, independently of its JSON/SSE parser.
+        raise await failure
+
+    async with asyncio.TaskGroup() as tasks:
+        watcher = tasks.create_task(watch_failure())
+        try:
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=False,
+                headers={"Accept-Encoding": "identity"},
+                event_hooks={"response": [bound_response]},
+            ) as client:
+                yield client
+        finally:
+            watcher.cancel()
 
 
 def _decode(result):
@@ -82,12 +112,7 @@ async def request(tool, arguments):
     """One bounded MCP connection per command; callers own task session IDs."""
     try:
         async with asyncio.timeout(DEADLINE_SECONDS):
-            async with httpx.AsyncClient(
-                timeout=30,
-                follow_redirects=False,
-                headers={"Accept-Encoding": "identity"},
-                event_hooks={"response": [_bound_response]},
-            ) as client:
+            async with _bounded_client() as client:
                 # Identify the project for aggregate free MCP usage measurement.
                 # Retain the HTTP library token; never add user/device identifiers.
                 client.headers["User-Agent"] = (

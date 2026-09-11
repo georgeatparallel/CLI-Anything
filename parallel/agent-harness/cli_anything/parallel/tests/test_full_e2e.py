@@ -33,6 +33,9 @@ def server(monkeypatch):
             message = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state["calls"].append((dict(self.headers), message, self.path))
             method = message["method"]
+            if method == "tools/call" and "release_call" in state:
+                state["call_started"].set()
+                state["release_call"].wait(5)
             if method.startswith("notifications/"):
                 self.send_response(202)
                 self.end_headers()
@@ -87,8 +90,14 @@ def server(monkeypatch):
                     "isError": state["mode"] == "tool",
                 }
             data = json.dumps(response).encode()
+            content_type = "application/json"
+            if state.get("sse"):
+                data = b"event: message\ndata: " + data + b"\n\n"
+                content_type = "text/event-stream"
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
+            if state.get("compressed"):
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             try:
@@ -158,6 +167,38 @@ def test_deadline_is_enforced(server, monkeypatch):
     monkeypatch.setattr(backend, "DEADLINE_SECONDS", 0.000001)
     with pytest.raises(backend.BackendError):
         call()
+
+
+@pytest.mark.parametrize("sse", [False, True])
+def test_response_limit_reports_the_limit_before_deadline(server, monkeypatch, sse):
+    server["sse"] = sse
+    server["mode"] = "oversize"
+    monkeypatch.setattr(backend, "DEADLINE_SECONDS", 2)
+    with pytest.raises(backend.BackendError, match="response exceeds the 2 MiB limit"):
+        call()
+
+
+def test_sse_search_preserves_result(server):
+    server["sse"] = True
+    assert call()["results"][0]["excerpts"] == ["public text"]
+
+
+def test_compressed_response_is_rejected(server):
+    server["compressed"] = True
+    with pytest.raises(backend.BackendError, match="Unexpected compressed MCP response"):
+        call()
+
+
+def test_deadline_cancels_an_inflight_call(server, monkeypatch):
+    server["call_started"] = threading.Event()
+    server["release_call"] = threading.Event()
+    monkeypatch.setattr(backend, "DEADLINE_SECONDS", 1)
+    try:
+        with pytest.raises(backend.BackendError, match="deadline"):
+            call()
+        assert server["call_started"].is_set()
+    finally:
+        server["release_call"].set()
 
 
 @pytest.mark.skipif(
